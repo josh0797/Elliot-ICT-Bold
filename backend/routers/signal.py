@@ -48,7 +48,7 @@ async def fetch_candles_polygon(symbol: str, timeframe: str, outputsize: int = 1
     date_from = (date.today() - timedelta(days=30)).isoformat()
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range"
-        f"/{multiplier}/{span}/{date_from}/{date_to}"
+        f"/{span}/{multiplier}/{date_from}/{date_to}" 
         f"?adjusted=true&sort=asc&limit={outputsize}&apiKey={POLYGON_API_KEY}"
     )
     async with httpx.AsyncClient(timeout=15) as client:
