@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 from typing import Optional
 import httpx
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 
 router = APIRouter()
 
@@ -16,6 +16,13 @@ TIMEFRAME_MAP = {
     "1D": "1day",
 }
 
+POLYGON_TIMEFRAME_MAP = {
+    "15min": ("minute", 15),
+    "1h":    ("hour",   1),
+    "4h":    ("hour",   4),
+    "1D":    ("day",    1),
+}
+
 KILL_ZONES = {
     "London Open": (7, 10),
     "New York Open": (12, 15),
@@ -27,30 +34,71 @@ KILL_ZONES = {
 # DATA FETCHING
 # ─────────────────────────────────────────
 
-async def fetch_candles(symbol: str, timeframe: str, outputsize: int = 100):
-    tf = TIMEFRAME_MAP.get(timeframe, "1h")
+def normalize_symbol_polygon(symbol: str) -> str:
+    clean = symbol.replace("/", "").replace("-", "")
+    forex_bases = ["EUR","GBP","AUD","NZD","USD","CAD","CHF","JPY"]
+    if any(clean.startswith(b) for b in forex_bases):
+        return f"C:{clean}"
+    return clean
+
+async def fetch_candles_polygon(symbol: str, timeframe: str, outputsize: int = 100):
+    multiplier, span = POLYGON_TIMEFRAME_MAP.get(timeframe, ("hour", 1))
+    ticker = normalize_symbol_polygon(symbol)
+    date_to   = date.today().isoformat()
+    date_from = (date.today() - timedelta(days=30)).isoformat()
     url = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={symbol}&interval={tf}&outputsize={outputsize}"
-        f"&apikey={TWELVE_DATA_API_KEY}&format=JSON"
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range"
+        f"/{multiplier}/{span}/{date_from}/{date_to}"
+        f"?adjusted=true&sort=asc&limit={outputsize}&apiKey={POLYGON_API_KEY}"
     )
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url)
         data = r.json()
 
-    if "values" not in data:
-        raise HTTPException(status_code=502, detail=f"Twelve Data error: {data.get('message', 'unknown')}")
+    if data.get("status") not in ("OK", "DELAYED") or not data.get("results"):
+        raise HTTPException(status_code=502, detail=f"Polygon error: {data.get('error', data.get('message', 'unknown'))}")
 
     candles = []
-    for v in reversed(data["values"]):
+    for v in data["results"]:
+        ts = datetime.fromtimestamp(v["t"] / 1000, tz=timezone.utc)
         candles.append({
-            "time": v["datetime"],
-            "open":  float(v["open"]),
-            "high":  float(v["high"]),
-            "low":   float(v["low"]),
-            "close": float(v["close"]),
+            "time":  ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "open":  float(v["o"]),
+            "high":  float(v["h"]),
+            "low":   float(v["l"]),
+            "close": float(v["c"]),
         })
     return candles
+
+async def fetch_candles(symbol: str, timeframe: str, outputsize: int = 100):
+    # Try Twelve Data first
+    try:
+        tf = TIMEFRAME_MAP.get(timeframe, "1h")
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval={tf}&outputsize={outputsize}"
+            f"&apikey={TWELVE_DATA_API_KEY}&format=JSON"
+        )
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            data = r.json()
+
+        if "values" in data:
+            candles = []
+            for v in reversed(data["values"]):
+                candles.append({
+                    "time":  v["datetime"],
+                    "open":  float(v["open"]),
+                    "high":  float(v["high"]),
+                    "low":   float(v["low"]),
+                    "close": float(v["close"]),
+                })
+            return candles
+    except Exception:
+        pass
+
+    # Fallback to Polygon
+    return await fetch_candles_polygon(symbol, timeframe, outputsize)
 
 
 # ─────────────────────────────────────────
@@ -109,13 +157,13 @@ def detect_elliott_waves(candles):
 
     recent = filtered[-6:] if len(filtered) >= 6 else filtered
 
-    # Bullish impulse: low-high-low-high-low-high
+    # Bullish impulse
     if (len(recent) >= 6 and
         recent[0]["type"] == "low" and recent[1]["type"] == "high" and
         recent[2]["type"] == "low" and recent[3]["type"] == "high" and
         recent[4]["type"] == "low" and recent[5]["type"] == "high"):
 
-        w0, w1, w2, w3, w4, w5 = recent[0], recent[1], recent[2], recent[3], recent[4], recent[5]
+        w0, w1, w2, w3, w4, w5 = recent
         wave1 = w1["price"] - w0["price"]
         wave3 = w3["price"] - w2["price"]
 
@@ -124,71 +172,51 @@ def detect_elliott_waves(candles):
             w4["price"] > w0["price"] and
             wave3 > wave1 * 0.618):
 
-            result["wave_type"] = "impulse"
-            result["bias"] = "bullish"
-            result["current_wave"] = 5
-            result["invalidation_line"] = w4["price"]
-            result["waves"] = [
-                {"label": "0", "price": w0["price"], "time": w0["time"]},
-                {"label": "1", "price": w1["price"], "time": w1["time"]},
-                {"label": "2", "price": w2["price"], "time": w2["time"]},
-                {"label": "3", "price": w3["price"], "time": w3["time"]},
-                {"label": "4", "price": w4["price"], "time": w4["time"]},
-                {"label": "5", "price": w5["price"], "time": w5["time"]},
-            ]
+            result.update({
+                "wave_type": "impulse", "bias": "bullish", "current_wave": 5,
+                "invalidation_line": w4["price"],
+                "waves": [{"label": str(i), "price": w["price"], "time": w["time"]}
+                          for i, w in enumerate([w0, w1, w2, w3, w4, w5])],
+            })
             return result
 
-    # Bearish impulse: high-low-high-low-high-low
+    # Bearish impulse
     if (len(recent) >= 6 and
         recent[0]["type"] == "high" and recent[1]["type"] == "low" and
         recent[2]["type"] == "high" and recent[3]["type"] == "low" and
         recent[4]["type"] == "high" and recent[5]["type"] == "low"):
 
-        w0, w1, w2, w3, w4, w5 = recent[0], recent[1], recent[2], recent[3], recent[4], recent[5]
+        w0, w1, w2, w3, w4, w5 = recent
 
         if (w2["price"] < w0["price"] and
             w3["price"] < w1["price"] and
             w4["price"] < w0["price"]):
 
-            result["wave_type"] = "impulse"
-            result["bias"] = "bearish"
-            result["current_wave"] = 5
-            result["invalidation_line"] = w4["price"]
-            result["waves"] = [
-                {"label": "0", "price": w0["price"], "time": w0["time"]},
-                {"label": "1", "price": w1["price"], "time": w1["time"]},
-                {"label": "2", "price": w2["price"], "time": w2["time"]},
-                {"label": "3", "price": w3["price"], "time": w3["time"]},
-                {"label": "4", "price": w4["price"], "time": w4["time"]},
-                {"label": "5", "price": w5["price"], "time": w5["time"]},
-            ]
+            result.update({
+                "wave_type": "impulse", "bias": "bearish", "current_wave": 5,
+                "invalidation_line": w4["price"],
+                "waves": [{"label": str(i), "price": w["price"], "time": w["time"]}
+                          for i, w in enumerate([w0, w1, w2, w3, w4, w5])],
+            })
             return result
 
     # Corrective A-B-C
     if len(recent) >= 3:
         last3 = recent[-3:]
+        labels = ["A", "B", "C"]
         if last3[0]["type"] == "high" and last3[1]["type"] == "low" and last3[2]["type"] == "high":
-            result["wave_type"] = "corrective"
-            result["bias"] = "bullish"
-            result["current_wave"] = "C"
-            result["invalidation_line"] = last3[1]["price"]
-            result["waves"] = [
-                {"label": "A", "price": last3[0]["price"], "time": last3[0]["time"]},
-                {"label": "B", "price": last3[1]["price"], "time": last3[1]["time"]},
-                {"label": "C", "price": last3[2]["price"], "time": last3[2]["time"]},
-            ]
+            result.update({
+                "wave_type": "corrective", "bias": "bullish", "current_wave": "C",
+                "invalidation_line": last3[1]["price"],
+                "waves": [{"label": l, "price": p["price"], "time": p["time"]} for l, p in zip(labels, last3)],
+            })
             return result
-
         if last3[0]["type"] == "low" and last3[1]["type"] == "high" and last3[2]["type"] == "low":
-            result["wave_type"] = "corrective"
-            result["bias"] = "bearish"
-            result["current_wave"] = "C"
-            result["invalidation_line"] = last3[1]["price"]
-            result["waves"] = [
-                {"label": "A", "price": last3[0]["price"], "time": last3[0]["time"]},
-                {"label": "B", "price": last3[1]["price"], "time": last3[1]["time"]},
-                {"label": "C", "price": last3[2]["price"], "time": last3[2]["time"]},
-            ]
+            result.update({
+                "wave_type": "corrective", "bias": "bearish", "current_wave": "C",
+                "invalidation_line": last3[1]["price"],
+                "waves": [{"label": l, "price": p["price"], "time": p["time"]} for l, p in zip(labels, last3)],
+            })
             return result
 
     return result
@@ -202,62 +230,31 @@ def detect_order_blocks(candles, lookback=20):
     obs = []
     recent = candles[-lookback:]
     for i in range(1, len(recent) - 1):
-        c = recent[i]
-        next_c = recent[i + 1]
+        c, next_c = recent[i], recent[i + 1]
         if c["close"] < c["open"] and next_c["close"] > next_c["open"]:
-            move = next_c["close"] - next_c["open"]
-            candle_range = c["open"] - c["close"]
-            if move > candle_range * 1.5:
-                obs.append({
-                    "type": "bullish_ob",
-                    "top": c["open"],
-                    "bottom": c["close"],
-                    "time": c["time"],
-                })
+            if (next_c["close"] - next_c["open"]) > (c["open"] - c["close"]) * 1.5:
+                obs.append({"type": "bullish_ob", "top": c["open"], "bottom": c["close"], "time": c["time"]})
         elif c["close"] > c["open"] and next_c["close"] < next_c["open"]:
-            move = next_c["open"] - next_c["close"]
-            candle_range = c["close"] - c["open"]
-            if move > candle_range * 1.5:
-                obs.append({
-                    "type": "bearish_ob",
-                    "top": c["close"],
-                    "bottom": c["open"],
-                    "time": c["time"],
-                })
+            if (next_c["open"] - next_c["close"]) > (c["close"] - c["open"]) * 1.5:
+                obs.append({"type": "bearish_ob", "top": c["close"], "bottom": c["open"], "time": c["time"]})
     return obs[-3:]
-
 
 def detect_fvg(candles, lookback=30):
     fvgs = []
     recent = candles[-lookback:]
     for i in range(1, len(recent) - 1):
-        prev = recent[i - 1]
-        curr = recent[i]
-        nxt  = recent[i + 1]
+        prev, curr, nxt = recent[i-1], recent[i], recent[i+1]
         if nxt["low"] > prev["high"]:
-            fvgs.append({
-                "type": "bullish_fvg",
-                "top": nxt["low"],
-                "bottom": prev["high"],
-                "time": curr["time"],
-            })
+            fvgs.append({"type": "bullish_fvg", "top": nxt["low"], "bottom": prev["high"], "time": curr["time"]})
         elif nxt["high"] < prev["low"]:
-            fvgs.append({
-                "type": "bearish_fvg",
-                "top": prev["low"],
-                "bottom": nxt["high"],
-                "time": curr["time"],
-            })
+            fvgs.append({"type": "bearish_fvg", "top": prev["low"], "bottom": nxt["high"], "time": curr["time"]})
     return fvgs[-3:]
 
-
 def detect_kill_zone(candles):
-    last_time = candles[-1]["time"]
     try:
-        dt = datetime.fromisoformat(last_time.replace(" ", "T"))
-        hour = dt.hour
+        dt = datetime.fromisoformat(candles[-1]["time"].replace(" ", "T"))
         for name, (start, end) in KILL_ZONES.items():
-            if start <= hour < end:
+            if start <= dt.hour < end:
                 return name
     except Exception:
         pass
@@ -269,75 +266,55 @@ def detect_kill_zone(candles):
 # ─────────────────────────────────────────
 
 def generate_trade_signal(candles, elliott, order_blocks, fvgs, kill_zone):
-    last = candles[-1]
-    price = last["close"]
+    price = candles[-1]["close"]
     bias = elliott.get("bias")
     invalidation = elliott.get("invalidation_line")
 
     if not bias or not invalidation:
-        return {
-            "signal_type": "NO_SIGNAL",
-            "entry": None, "sl": None, "tp1": None, "tp2": None,
-            "confidence": 0.0, "risk_reward": 0.0,
-            "reason": ["Insufficient Elliott Wave data"]
-        }
+        return {"signal_type": "NO_SIGNAL", "entry": None, "sl": None,
+                "tp1": None, "tp2": None, "confidence": 0.0, "risk_reward": 0.0,
+                "reason": ["Insufficient Elliott Wave data"]}
 
-    relevant_obs = [ob for ob in order_blocks if
-                    (bias == "bullish" and ob["type"] == "bullish_ob") or
-                    (bias == "bearish" and ob["type"] == "bearish_ob")]
-
-    relevant_fvgs = [fvg for fvg in fvgs if
-                     (bias == "bullish" and fvg["type"] == "bullish_fvg") or
-                     (bias == "bearish" and fvg["type"] == "bearish_fvg")]
+    relevant_obs  = [ob  for ob  in order_blocks if (bias == "bullish" and ob["type"]  == "bullish_ob")  or (bias == "bearish" and ob["type"]  == "bearish_ob")]
+    relevant_fvgs = [fvg for fvg in fvgs         if (bias == "bullish" and fvg["type"] == "bullish_fvg") or (bias == "bearish" and fvg["type"] == "bearish_fvg")]
 
     atr = np.mean([c["high"] - c["low"] for c in candles[-14:]])
-    reason = []
-    signal_type = None
-    entry = None
+    reason, signal_type, entry = [], None, None
 
     if bias == "bullish":
         if relevant_obs:
             ob = relevant_obs[-1]
-            entry = round((ob["top"] + ob["bottom"]) / 2, 5)
-            signal_type = "BUY_LIMIT"
+            entry, signal_type = round((ob["top"] + ob["bottom"]) / 2, 5), "BUY_LIMIT"
             reason.append("Price near bullish Order Block")
         elif relevant_fvgs:
             fvg = relevant_fvgs[-1]
-            entry = round((fvg["top"] + fvg["bottom"]) / 2, 5)
-            signal_type = "BUY_LIMIT"
+            entry, signal_type = round((fvg["top"] + fvg["bottom"]) / 2, 5), "BUY_LIMIT"
             reason.append("Price in bullish Fair Value Gap")
         else:
-            entry = round(price, 5)
-            signal_type = "BUY_STOP"
+            entry, signal_type = round(price, 5), "BUY_STOP"
             reason.append("Breakout entry — no OB/FVG nearby")
-
         sl  = round(invalidation - atr * 0.3, 5)
         tp1 = round(entry + atr * 2, 5)
         tp2 = round(entry + atr * 4, 5)
-
     else:
         if relevant_obs:
             ob = relevant_obs[-1]
-            entry = round((ob["top"] + ob["bottom"]) / 2, 5)
-            signal_type = "SELL_LIMIT"
+            entry, signal_type = round((ob["top"] + ob["bottom"]) / 2, 5), "SELL_LIMIT"
             reason.append("Price near bearish Order Block")
         elif relevant_fvgs:
             fvg = relevant_fvgs[-1]
-            entry = round((fvg["top"] + fvg["bottom"]) / 2, 5)
-            signal_type = "SELL_LIMIT"
+            entry, signal_type = round((fvg["top"] + fvg["bottom"]) / 2, 5), "SELL_LIMIT"
             reason.append("Price in bearish Fair Value Gap")
         else:
-            entry = round(price, 5)
-            signal_type = "SELL_STOP"
+            entry, signal_type = round(price, 5), "SELL_STOP"
             reason.append("Breakout entry — no OB/FVG nearby")
-
         sl  = round(invalidation + atr * 0.3, 5)
         tp1 = round(entry - atr * 2, 5)
         tp2 = round(entry - atr * 4, 5)
 
     confidence = 0.4
-    if relevant_obs:   confidence += 0.2
-    if relevant_fvgs:  confidence += 0.15
+    if relevant_obs:                          confidence += 0.2
+    if relevant_fvgs:                         confidence += 0.15
     if kill_zone:
         confidence += 0.15
         reason.append(f"Active Kill Zone: {kill_zone}")
@@ -348,16 +325,9 @@ def generate_trade_signal(candles, elliott, order_blocks, fvgs, kill_zone):
     confidence = round(min(confidence, 0.99), 2)
     rr = round(abs(tp1 - entry) / abs(entry - sl), 2) if entry != sl else 0
 
-    return {
-        "signal_type": signal_type,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "confidence": confidence,
-        "risk_reward": rr,
-        "reason": reason,
-    }
+    return {"signal_type": signal_type, "entry": entry, "sl": sl,
+            "tp1": tp1, "tp2": tp2, "confidence": confidence,
+            "risk_reward": rr, "reason": reason}
 
 
 # ─────────────────────────────────────────
@@ -366,8 +336,7 @@ def generate_trade_signal(candles, elliott, order_blocks, fvgs, kill_zone):
 
 @router.get("/signal")
 async def get_signal(symbol: str = "EUR/USD", timeframe: str = "1h"):
-    candles = await fetch_candles(symbol, timeframe, outputsize=100)
-
+    candles   = await fetch_candles(symbol, timeframe, outputsize=100)
     elliott   = detect_elliott_waves(candles)
     obs       = detect_order_blocks(candles)
     fvgs      = detect_fvg(candles)
