@@ -93,8 +93,8 @@ export default function TradingChart({ data, symbol, interval, signal }: Props) 
   }, [data]);
 
   // ── Draw overlays when signal changes ───────────────────
-  useEffect(() => {
-    if (!chartRef.current || !seriesRef.current || data.length === 0) return;
+ useEffect(() => {
+  if (!chartRef.current || !seriesRef.current || data.length === 0) return;
 
     // Remove previous overlays
     overlaysRef.current.forEach((s) => {
