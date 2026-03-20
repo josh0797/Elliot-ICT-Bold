@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { OHLCVBar } from '@/lib/types';
 import { generateMockOHLCV } from '@/lib/mockOHLCV';
+import SignalPanel from '@/components/SignalPanel';
 
 const TradingChart = dynamic(() => import('@/components/TradingChart'), {
   ssr: false,
@@ -260,7 +261,15 @@ export default function DashboardClient() {
       </header>
 
       <div className="flex flex-1 overflow-hidden" style={{ minHeight: 0 }}>
-        <div className="flex-1 overflow-hidden relative" style={{ minHeight: 0 }}>
+  {/* Signal Panel lateral */}
+  <div className="shrink-0 overflow-hidden" style={{ width: 220, borderRight: '1px solid #1E2130' }}>
+    <SignalPanel
+      symbol={parseSym(sym).label}
+      timeframe={tf}
+    />
+  </div>
+
+  <div className="flex-1 overflow-hidden relative" style={{ minHeight: 0 }}>
           {loading && bars.length === 0 ? (
             <div
               className="absolute inset-0 flex flex-col gap-3 p-4"
