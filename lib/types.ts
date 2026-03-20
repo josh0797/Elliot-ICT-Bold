@@ -235,3 +235,50 @@ export interface RawScoreResult {
   breakdown: ScoreBreakdown;
   setupType: 'impulso' | 'reversion' | 'pullback' | 'unknown';
 }
+// ── Railway Backend Signal ──────────────────────────────
+export interface ElliottWave {
+  wave_type:        'impulse' | 'corrective' | null;
+  bias:             'bullish' | 'bearish' | null;
+  current_wave:     string | number | null;
+  invalidation_line: number | null;
+  waves: {
+    label: string;
+    price: number;
+    time:  string;
+  }[];
+}
+
+export interface ICTData {
+  order_blocks: {
+    type:   'bullish_ob' | 'bearish_ob';
+    top:    number;
+    bottom: number;
+    time:   string;
+  }[];
+  fvgs: {
+    type:   'bullish_fvg' | 'bearish_fvg';
+    top:    number;
+    bottom: number;
+    time:   string;
+  }[];
+  kill_zone: string | null;
+}
+
+export interface RailwaySignal {
+  status:       string;
+  symbol:       string;
+  timeframe:    string;
+  price:        number;
+  timestamp:    string;
+  signal_type:  'BUY_LIMIT' | 'SELL_LIMIT' | 'BUY_STOP' | 'SELL_STOP' | 'NO_SIGNAL';
+  entry:        number | null;
+  sl:           number | null;
+  tp1:          number | null;
+  tp2:          number | null;
+  confidence:   number;
+  risk_reward:  number;
+  reason:       string[];
+  elliott:      ElliottWave;
+  ict:          ICTData;
+  source:       string;
+}
