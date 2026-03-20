@@ -144,6 +144,7 @@ export default function DashboardClient() {
 
   useEffect(() => {
   const { label } = parseSym(sym);
+  setSignal(null);  // ← ya lo tienes
   fetch(`/api/signal?symbol=${encodeURIComponent(label)}&timeframe=${tf}`)
     .then((r) => r.json())
     .then((d) => setSignal(d))
