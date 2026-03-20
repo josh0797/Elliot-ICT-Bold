@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import { OHLCVBar } from '@/lib/types';
 import { generateMockOHLCV } from '@/lib/mockOHLCV';
 import SignalPanel from '@/components/SignalPanel';
+import { RailwaySignal } from '@/lib/types';
 
 const TradingChart = dynamic(() => import('@/components/TradingChart'), {
   ssr: false,
@@ -62,6 +63,7 @@ export default function DashboardClient() {
   const [price,     setPrice]     = useState<number | null>(null);
   const [priceUp,   setPriceUp]   = useState<boolean | null>(null);
   const [throttled, setThrottled] = useState(false);
+  const [signal, setSignal] = useState<RailwaySignal | null>(null);
 
   const symRef     = useRef(sym);
   const prevPrice  = useRef<number | null>(null);
@@ -139,6 +141,14 @@ export default function DashboardClient() {
       if (quoteTimer.current) clearInterval(quoteTimer.current);
     };
   }, [sym, pollQuote]);
+
+  useEffect(() => {
+  const { label } = parseSym(sym);
+  fetch(`/api/signal?symbol=${encodeURIComponent(label)}&timeframe=${tf}`)
+    .then((r) => r.json())
+    .then((d) => setSignal(d))
+    .catch(() => setSignal(null));
+}, [sym, tf]);
 
   const { ticker, label: symLabel } = parseSym(sym);
   const prec = PREC[ticker] ?? 2;
@@ -317,7 +327,7 @@ export default function DashboardClient() {
                   />
                 </div>
               )}
-              <TradingChart data={bars} symbol={symLabel} interval={TIMEFRAMES.find((t) => t.value === tf)?.label ?? tf} />
+             <TradingChart data={bars} symbol={symLabel} interval={TIMEFRAMES.find((t) => t.value === tf)?.label ?? tf} signal={signal} />
             </>
           )}
         </div>
