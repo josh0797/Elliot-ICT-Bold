@@ -74,7 +74,7 @@ export default function SignalPanel({ symbol, timeframe }: SignalPanelProps) {
               className="px-3 py-1 rounded font-bold text-sm"
               style={{ background: colors.bg, color: colors.color }}
             >
-              {data.signal_type.replace('_', ' ')}
+              {(data.signal_type ?? 'NO_SIGNAL').replace(/_/g, ' ')}
             </span>
             <span style={{ color: '#758696' }}>
               Conf: <span style={{ color: '#D1D4DC', fontWeight: 600 }}>

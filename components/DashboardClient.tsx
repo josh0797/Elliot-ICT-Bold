@@ -1,11 +1,18 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
-import { OHLCVBar } from '@/lib/types';
+import { OHLCVBar, RailwaySignal, AnalysisResult, StructureContext, TradeSetup, Candle } from '@/lib/types';
 import { generateMockOHLCV } from '@/lib/mockOHLCV';
-import SignalPanel from '@/components/SignalPanel';
-import { RailwaySignal } from '@/lib/types';
+import { LayerFlags } from '@/components/TradingChart';
+import {
+  detectWaves, detectICT, detectSwings, detectSweeps,
+  detectBOS, detectCHoCH, retroLink, buildSetup, analyze,
+} from '@/lib/analysis';
+import SessionsPanel   from '@/components/SessionsPanel';
+import RiskPanel       from '@/components/RiskPanel';
+import AnalysisPanel   from '@/components/AnalysisPanel';
+import AlertsPanel     from '@/components/AlertsPanel';
 
 const TradingChart = dynamic(() => import('@/components/TradingChart'), {
   ssr: false,
@@ -14,27 +21,28 @@ const TradingChart = dynamic(() => import('@/components/TradingChart'), {
 
 type Source = 'twelvedata' | 'polygon' | 'demo';
 type BadgeState = 'live' | 'throttled' | 'demo';
+type RightTab = 'analysis' | 'risk' | 'alerts';
 
 const SYMBOLS = [
-  { group: 'Forex',  value: 'fx|EURUSD|EUR/USD',     label: 'EUR/USD' },
-  { group: 'Forex',  value: 'fx|GBPUSD|GBP/USD',     label: 'GBP/USD' },
-  { group: 'Forex',  value: 'fx|USDJPY|USD/JPY',     label: 'USD/JPY' },
-  { group: 'Forex',  value: 'fx|USDCAD|USD/CAD',     label: 'USD/CAD' },
-  { group: 'Forex',  value: 'fx|AUDUSD|AUD/USD',     label: 'AUD/USD' },
-  { group: 'Metals', value: 'fx|XAUUSD|XAU/USD',     label: 'XAU/USD' },
-  { group: 'Crypto', value: 'crypto|BTCUSD|BTC/USD',  label: 'BTC/USD' },
-  { group: 'Crypto', value: 'crypto|ETHUSD|ETH/USD',  label: 'ETH/USD' },
-  { group: 'Crypto', value: 'crypto|SOLUSD|SOL/USD',  label: 'SOL/USD' },
-  { group: 'Stocks', value: 'stock|AAPL|AAPL',        label: 'AAPL' },
-  { group: 'Stocks', value: 'stock|TSLA|TSLA',        label: 'TSLA' },
-  { group: 'Stocks', value: 'stock|NVDA|NVDA',        label: 'NVDA' },
+  { group: 'Forex',  value: 'fx|EURUSD|EUR/USD',    label: 'EUR/USD' },
+  { group: 'Forex',  value: 'fx|GBPUSD|GBP/USD',    label: 'GBP/USD' },
+  { group: 'Forex',  value: 'fx|USDJPY|USD/JPY',    label: 'USD/JPY' },
+  { group: 'Forex',  value: 'fx|USDCAD|USD/CAD',    label: 'USD/CAD' },
+  { group: 'Forex',  value: 'fx|AUDUSD|AUD/USD',    label: 'AUD/USD' },
+  { group: 'Metals', value: 'fx|XAUUSD|XAU/USD',    label: 'XAU/USD' },
+  { group: 'Crypto', value: 'crypto|BTCUSD|BTC/USD', label: 'BTC/USD' },
+  { group: 'Crypto', value: 'crypto|ETHUSD|ETH/USD', label: 'ETH/USD' },
+  { group: 'Crypto', value: 'crypto|SOLUSD|SOL/USD', label: 'SOL/USD' },
+  { group: 'Stocks', value: 'stock|AAPL|AAPL',       label: 'AAPL'    },
+  { group: 'Stocks', value: 'stock|TSLA|TSLA',       label: 'TSLA'    },
+  { group: 'Stocks', value: 'stock|NVDA|NVDA',       label: 'NVDA'    },
 ];
 
 const TIMEFRAMES = [
   { label: '15M', value: '15min' },
-  { label: '1H',  value: '1h' },
+  { label: '1H',  value: '1h'   },
   { label: '1D',  value: '1day' },
-  { label: '1W',  value: '1week' },
+  { label: '1W',  value: '1week'},
 ];
 
 const PREC: Record<string, number> = {
@@ -49,21 +57,46 @@ const BADGE_CFG: Record<BadgeState, { label: string; dot: string; bg: string; co
   demo:      { label: 'DEMO',               dot: '#ffd166', bg: 'rgba(255,209,102,0.1)', color: '#ffd166' },
 };
 
+const LAYER_LABELS: { key: keyof LayerFlags; label: string }[] = [
+  { key: 'fvg',       label: 'FVG'   },
+  { key: 'ob',        label: 'OB'    },
+  { key: 'fibonacci', label: 'Fib'   },
+  { key: 'entry',     label: 'Entry' },
+  { key: 'sl',        label: 'SL'    },
+  { key: 'tp',        label: 'TP'    },
+  { key: 'elliott',   label: 'Wave'  },
+];
+
+const DEFAULT_LAYERS: LayerFlags = {
+  fvg: true, ob: true, fibonacci: false,
+  entry: true, sl: true, tp: true, elliott: true,
+};
+
 function parseSym(sym: string) {
   const parts = sym.split('|');
   return { type: parts[0] ?? 'fx', ticker: parts[1] ?? '', label: parts[2] ?? parts[1] ?? '' };
 }
 
+function barsToCandles(bars: OHLCVBar[]): Candle[] {
+  return bars.map((b) => ({
+    t: new Date(b.time * 1000),
+    o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume,
+  }));
+}
+
 export default function DashboardClient() {
-  const [sym,       setSym]       = useState('fx|EURUSD|EUR/USD');
-  const [tf,        setTf]        = useState('1h');
-  const [bars,      setBars]      = useState<OHLCVBar[]>([]);
-  const [source,    setSource]    = useState<Source>('demo');
-  const [loading,   setLoading]   = useState(true);
-  const [price,     setPrice]     = useState<number | null>(null);
-  const [priceUp,   setPriceUp]   = useState<boolean | null>(null);
-  const [throttled, setThrottled] = useState(false);
-  const [signal, setSignal] = useState<RailwaySignal | null>(null);
+  const [sym,        setSym]        = useState('fx|EURUSD|EUR/USD');
+  const [tf,         setTf]         = useState('1h');
+  const [bars,       setBars]       = useState<OHLCVBar[]>([]);
+  const [source,     setSource]     = useState<Source>('demo');
+  const [loading,    setLoading]    = useState(true);
+  const [price,      setPrice]      = useState<number | null>(null);
+  const [priceUp,    setPriceUp]    = useState<boolean | null>(null);
+  const [throttled,  setThrottled]  = useState(false);
+  const [signal,     setSignal]     = useState<RailwaySignal | null>(null);
+  const [sigLoading, setSigLoading] = useState(false);
+  const [layers,     setLayers]     = useState<LayerFlags>(DEFAULT_LAYERS);
+  const [rightTab,   setRightTab]   = useState<RightTab>('analysis');
 
   const symRef     = useRef(sym);
   const prevPrice  = useRef<number | null>(null);
@@ -72,11 +105,33 @@ export default function DashboardClient() {
 
   useEffect(() => { symRef.current = sym; }, [sym]);
 
+  // ── Local analysis ───────────────────────────────────────
+  const { analysis, structure, setup } = useMemo<{
+    analysis:  AnalysisResult | null;
+    structure: StructureContext | null;
+    setup:     TradeSetup | null;
+  }>(() => {
+    if (bars.length < 20) return { analysis: null, structure: null, setup: null };
+    try {
+      const candles = barsToCandles(bars);
+      const waves   = detectWaves(candles);
+      const zones   = detectICT(candles);
+      const swings  = detectSwings(candles);
+      const sweeps  = detectSweeps(candles, swings);
+      const bos     = detectBOS(candles, swings, sweeps, waves.length > 0 ? { currentWave: waves.at(-1)?.label ?? null } : null);
+      const chochs  = retroLink(detectCHoCH(candles, swings, sweeps), bos);
+      const { setups, context } = buildSetup(candles, swings, sweeps, bos, chochs, waves, zones, sym);
+      const res = analyze(candles, waves, zones, sym);
+      return { analysis: res, structure: context, setup: setups[0] ?? null };
+    } catch {
+      return { analysis: null, structure: null, setup: null };
+    }
+  }, [bars, sym]);
+
   const doLoad = useCallback(async (symVal: string, tfVal: string) => {
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-
     const { type, ticker } = parseSym(symVal);
     setBars([]);
     setLoading(true);
@@ -104,7 +159,7 @@ export default function DashboardClient() {
         setSource((json.source as Source) ?? 'demo');
       }
     } catch {
-      // aborted (timeout) or network error — keep whatever is showing
+      // aborted/timeout — demo data set
     } finally {
       clearTimeout(timeoutId);
       setLoading(false);
@@ -114,7 +169,7 @@ export default function DashboardClient() {
   const pollQuote = useCallback(async () => {
     const { type, ticker } = parseSym(symRef.current);
     try {
-      const res = await fetch(`/api/quote?ticker=${ticker}&type=${type}`);
+      const res  = await fetch(`/api/quote?ticker=${ticker}&type=${type}`);
       const json = await res.json() as { price?: number };
       if (typeof json.price === 'number') {
         const p = json.price;
@@ -122,14 +177,10 @@ export default function DashboardClient() {
         prevPrice.current = p;
         setPrice(p);
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
-  useEffect(() => {
-    doLoad(sym, tf);
-  }, [sym, tf, doLoad]);
+  useEffect(() => { doLoad(sym, tf); }, [sym, tf, doLoad]);
 
   useEffect(() => {
     if (quoteTimer.current) clearInterval(quoteTimer.current);
@@ -137,19 +188,21 @@ export default function DashboardClient() {
     setPrice(null);
     pollQuote();
     quoteTimer.current = setInterval(pollQuote, 15_000);
-    return () => {
-      if (quoteTimer.current) clearInterval(quoteTimer.current);
-    };
+    return () => { if (quoteTimer.current) clearInterval(quoteTimer.current); };
   }, [sym, pollQuote]);
 
   useEffect(() => {
-  const { label } = parseSym(sym);
-  setSignal(null);  // ← ya lo tienes
-  fetch(`/api/signal?symbol=${encodeURIComponent(label)}&timeframe=${tf}`)
-    .then((r) => r.json())
-    .then((d) => setSignal(d))
-    .catch(() => setSignal(null));
-}, [sym, tf]);
+    const { label } = parseSym(sym);
+    setSignal(null);
+    setSigLoading(true);
+    fetch(`/api/signal?symbol=${encodeURIComponent(label)}&timeframe=${tf}`)
+      .then((r) => r.json())
+      .then((d) => { setSignal(d); setSigLoading(false); })
+      .catch(() => { setSignal(null); setSigLoading(false); });
+  }, [sym, tf]);
+
+  const toggleLayer = (key: keyof LayerFlags) =>
+    setLayers((prev) => ({ ...prev, [key]: !prev[key] }));
 
   const { ticker, label: symLabel } = parseSym(sym);
   const prec = PREC[ticker] ?? 2;
@@ -159,11 +212,12 @@ export default function DashboardClient() {
 
   return (
     <main className="flex flex-col w-screen h-screen overflow-hidden" style={{ background: '#0D0E14' }}>
+      {/* ── Header ── */}
       <header
-        className="flex items-center justify-between px-4 shrink-0"
+        className="flex items-center justify-between px-4 shrink-0 gap-2"
         style={{ height: 48, borderBottom: '1px solid #1E2130', background: '#0D0E14' }}
       >
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 min-w-0">
           <div
             className="flex items-center justify-center text-xs font-bold rounded shrink-0"
             style={{
@@ -193,13 +247,13 @@ export default function DashboardClient() {
             ))}
           </select>
 
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-0.5">
             {TIMEFRAMES.map((t) => (
               <button
                 key={t.value}
                 onClick={() => setTf(t.value)}
                 style={{
-                  padding: '3px 10px', borderRadius: 4, fontSize: 12, fontWeight: 600,
+                  padding: '3px 8px', borderRadius: 4, fontSize: 12, fontWeight: 600,
                   border: 'none', cursor: 'pointer',
                   background: tf === t.value ? '#26A69A' : 'transparent',
                   color:      tf === t.value ? '#0D0E14'  : '#758696',
@@ -210,11 +264,34 @@ export default function DashboardClient() {
               </button>
             ))}
           </div>
+
+          {/* Layer toggles */}
+          <div
+            className="flex items-center gap-0.5 px-1.5 py-1 rounded"
+            style={{ background: '#131722', border: '1px solid #1E2130' }}
+          >
+            {LAYER_LABELS.map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => toggleLayer(key)}
+                title={`Toggle ${label}`}
+                style={{
+                  padding: '2px 6px', borderRadius: 3, fontSize: 11, fontWeight: 600,
+                  border: 'none', cursor: 'pointer',
+                  background: layers[key] ? 'rgba(38,166,154,0.2)' : 'transparent',
+                  color:      layers[key] ? '#26A69A'               : '#758696',
+                  transition: 'background 0.15s, color 0.15s',
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 shrink-0">
           {price !== null && (
-            <div className="flex items-center gap-2" suppressHydrationWarning>
+            <div className="flex items-center gap-1.5" suppressHydrationWarning>
               <span
                 suppressHydrationWarning
                 style={{
@@ -266,21 +343,27 @@ export default function DashboardClient() {
               transition: 'background 0.15s',
             }}
           >
-            {loading ? 'Cargando...' : 'Cargar'}
+            {loading ? 'Loading…' : 'Load'}
           </button>
         </div>
       </header>
 
+      {/* ── Body ── */}
       <div className="flex flex-1 overflow-hidden" style={{ minHeight: 0 }}>
-  {/* Signal Panel lateral */}
-  <div className="shrink-0 overflow-hidden" style={{ width: 220, borderRight: '1px solid #1E2130' }}>
-    <SignalPanel
-      symbol={parseSym(sym).label}
-      timeframe={tf}
-    />
-  </div>
 
-  <div className="flex-1 overflow-hidden relative" style={{ minHeight: 0 }}>
+        {/* Left sidebar: Sessions + Risk */}
+        <div
+          className="flex flex-col shrink-0 overflow-hidden"
+          style={{ width: 200, borderRight: '1px solid #1E2130' }}
+        >
+          <SessionsPanel />
+          <div className="flex-1 overflow-hidden">
+            <RiskPanel signal={signal} ticker={ticker} />
+          </div>
+        </div>
+
+        {/* Center: Chart */}
+        <div className="flex-1 overflow-hidden relative" style={{ minHeight: 0 }}>
           {loading && bars.length === 0 ? (
             <div
               className="absolute inset-0 flex flex-col gap-3 p-4"
@@ -328,9 +411,69 @@ export default function DashboardClient() {
                   />
                 </div>
               )}
-             <TradingChart data={bars} symbol={symLabel} interval={TIMEFRAMES.find((t) => t.value === tf)?.label ?? tf} signal={signal} />
+              <TradingChart
+                data={bars}
+                symbol={symLabel}
+                interval={TIMEFRAMES.find((t) => t.value === tf)?.label ?? tf}
+                signal={signal}
+                analysis={analysis}
+                layers={layers}
+              />
             </>
           )}
+        </div>
+
+        {/* Right: tabbed panel */}
+        <div
+          className="flex flex-col shrink-0 overflow-hidden"
+          style={{ width: 260, borderLeft: '1px solid #1E2130' }}
+        >
+          <div
+            className="flex shrink-0"
+            style={{ borderBottom: '1px solid #1E2130' }}
+          >
+            {([
+              { id: 'analysis' as RightTab, label: 'Analysis' },
+              { id: 'risk'     as RightTab, label: 'Risk'     },
+              { id: 'alerts'   as RightTab, label: 'Alerts'   },
+            ]).map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setRightTab(t.id)}
+                className="flex-1 py-2 text-xs font-semibold"
+                style={{
+                  color:        rightTab === t.id ? '#D1D4DC' : '#758696',
+                  borderBottom: rightTab === t.id ? '2px solid #26A69A' : '2px solid transparent',
+                  background:   'transparent', cursor: 'pointer',
+                  transition:   'color 0.15s, border-color 0.15s',
+                }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex-1 overflow-hidden">
+            {rightTab === 'analysis' && (
+              <AnalysisPanel
+                signal={signal}
+                analysis={analysis}
+                structure={structure}
+                setup={setup}
+                loading={sigLoading}
+              />
+            )}
+            {rightTab === 'risk' && (
+              <RiskPanel signal={signal} ticker={ticker} />
+            )}
+            {rightTab === 'alerts' && (
+              <AlertsPanel
+                signal={signal}
+                symbol={symLabel}
+                timeframe={tf}
+              />
+            )}
+          </div>
         </div>
       </div>
 
